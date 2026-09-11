@@ -1,728 +1,778 @@
-# Bài tập 3: Khắc phục Cascading Failure do thiếu Timeout trong RestTemplate
+# BÀI TẬP 4: PHÂN TÍCH HỢP ĐỒNG API VÀ TÁC ĐỘNG KHI FEIGNCLIENT INTERFACE THAY ĐỔI
 
-**Mã bài:** SPRING-CLOUD-S06-EX03
-**Cấp độ:** Vận dụng chuyên sâu
-**Hệ thống:** VietMart
-**Service:** inventory-service
+**Mã bài toán:** SPRING-CLOUD-S05-EX04
+**Chủ đề:** API Contract, FeignClient và API Versioning
+**Ngôn ngữ:** Java 21
+**Build Tool:** Gradle
 
 ---
 
 ## 1. Mục tiêu
 
-Bài tập nhằm phân tích và khắc phục hiện tượng **cascading failure** xảy ra khi `inventory-service` gọi `product-service` bằng `RestTemplate` nhưng không cấu hình timeout.
+Bài tập nhằm phân tích tác động của việc thay đổi API contract giữa `product-service` và các service sử dụng FeignClient.
 
-Các mục tiêu chính:
+Các nội dung chính:
 
-* Phân tích nguyên nhân gây cascading failure.
-* Xác định các lỗi trong implementation ban đầu.
-* Cấu hình `@LoadBalanced RestTemplate`.
-* Sử dụng service-id thay cho IP hardcode.
-* Thiết lập `connectTimeout = 1s`.
-* Thiết lập `readTimeout = 2s`.
-* Xử lý `ResourceAccessException`.
-* Trả về fallback `StockInfo.unavailable()`.
-* Sử dụng WireMock để mô phỏng `product-service` phản hồi chậm 5 giây.
-* Chứng minh request được timeout và fallback trong dưới 3 giây.
-* Đề xuất Circuit Breaker để tăng khả năng chống cascading failure.
+* Phân tích tác động khi đổi tên field JSON từ `name` thành `productName`.
+* Phân tích tác động khi thay đổi API path.
+* Hiểu sự phụ thuộc của FeignClient vào API contract.
+* Đề xuất chiến lược versioning API.
+* Thiết kế DTO phía client có khả năng tương thích với cả API cũ và API mới.
+* Kiểm thử khả năng deserialize cả hai định dạng JSON.
 
 ---
 
-# 2. Phân tích vấn đề ban đầu
+# 2. Kiến trúc và API Contract
 
-Implementation ban đầu của `StockCheckClient` có dạng:
+Giả sử hệ thống gồm:
+
+```text
+                         +------------------+
+                         |  product-service |
+                         +---------+--------+
+                                   |
+                  +----------------+----------------+
+                  |                |                |
+                  v                v                v
+           order-service   inventory-service   report-service
+                  |                |                |
+                  +------- FeignClient ------------+
+```
+
+`product-service` cung cấp thông tin sản phẩm.
+
+API cũ:
+
+```http
+GET /api/products/{id}
+```
+
+Response:
+
+```json
+{
+    "id": 100,
+    "name": "Laptop Dell",
+    "price": 25000000
+}
+```
+
+---
+
+# 3. Phân tích thay đổi JSON field
+
+## 3.1. API contract cũ
+
+API trả về:
+
+```json
+{
+    "id": 100,
+    "name": "Laptop Dell",
+    "price": 25000000
+}
+```
+
+Client sử dụng DTO:
 
 ```java
-@Component
-public class StockCheckClient {
+public record ProductInfo(
+        Long id,
+        String name,
+        Long price
+) {
+}
+```
 
-    @Autowired
-    private RestTemplate restTemplate;
+Khi đó Jackson ánh xạ:
 
-    public StockInfo checkStock(Long productId) {
-        return restTemplate.getForObject(
-                "http://192.168.0.12:8082/api/stock/{pid}",
-                StockInfo.class,
-                productId
-        );
+```text
+JSON name
+    ↓
+ProductInfo.name
+```
+
+Dữ liệu nhận được:
+
+```text
+id    = 100
+name  = "Laptop Dell"
+price = 25000000
+```
+
+---
+
+## 3.2. API thay đổi `name` thành `productName`
+
+Nếu `product-service` thay đổi response thành:
+
+```json
+{
+    "id": 100,
+    "productName": "Laptop Dell",
+    "price": 25000000
+}
+```
+
+nhưng client vẫn sử dụng:
+
+```java
+public record ProductInfo(
+        Long id,
+        String name,
+        Long price
+) {
+}
+```
+
+thì field `name` không còn được tìm thấy trong JSON.
+
+Kết quả thông thường:
+
+```text
+ProductInfo.name = null
+```
+
+Đây là một **breaking change về schema/contract** đối với client đang phụ thuộc vào field `name`.
+
+---
+
+# 4. Tác động đến các service
+
+## 4.1. order-service
+
+`order-service` có thể sử dụng tên sản phẩm để:
+
+* Hiển thị thông tin đơn hàng.
+* Tạo order item.
+* Ghi log.
+* Gửi thông báo cho khách hàng.
+
+Nếu `name = null`, dữ liệu có thể trở thành:
+
+```text
+Product: null
+```
+
+Nếu code xử lý không kiểm tra null, có thể xảy ra:
+
+```text
+NullPointerException
+```
+
+Ngoài ra, nếu hệ thống cho phép lưu dữ liệu null thì order vẫn có thể được tạo nhưng thông tin sản phẩm bị thiếu.
+
+---
+
+## 4.2. inventory-service
+
+`inventory-service` có thể sử dụng thông tin sản phẩm để:
+
+* Hiển thị sản phẩm tồn kho.
+* Ghi log.
+* Tạo báo cáo tồn kho.
+* Kiểm tra thông tin sản phẩm.
+
+Khi `name` trở thành `null`, các chức năng phụ thuộc vào tên sản phẩm có thể hiển thị dữ liệu không chính xác hoặc phát sinh exception nếu không xử lý null.
+
+---
+
+## 4.3. report-service
+
+`report-service` có thể sử dụng:
+
+```text
+ProductInfo.name
+```
+
+để tạo báo cáo.
+
+Khi field bị đổi tên:
+
+```text
+Laptop Dell
+```
+
+có thể trở thành:
+
+```text
+null
+```
+
+trong báo cáo.
+
+Hậu quả:
+
+* Báo cáo thiếu tên sản phẩm.
+* Dữ liệu hiển thị không đầy đủ.
+* Có thể lỗi khi xử lý chuỗi hoặc template.
+* Có thể ảnh hưởng đến dữ liệu tổng hợp.
+
+---
+
+# 5. Phân biệt lỗi field và lỗi endpoint
+
+Hai thay đổi sau có mức độ ảnh hưởng khác nhau.
+
+## 5.1. Đổi tên field
+
+Từ:
+
+```json
+"name": "Laptop Dell"
+```
+
+thành:
+
+```json
+"productName": "Laptop Dell"
+```
+
+Thông thường HTTP request vẫn thành công:
+
+```text
+HTTP 200 OK
+```
+
+nhưng DTO client có thể nhận:
+
+```text
+name = null
+```
+
+Vì vậy đây là lỗi **schema compatibility**.
+
+---
+
+## 5.2. Đổi API path
+
+API cũ:
+
+```http
+GET /api/products/100
+```
+
+API mới:
+
+```http
+GET /api/v2/products/100
+```
+
+Nếu FeignClient vẫn gọi:
+
+```java
+@GetMapping("/api/products/{id}")
+```
+
+nhưng server chỉ còn:
+
+```http
+/api/v2/products/{id}
+```
+
+thì request sẽ nhận:
+
+```text
+HTTP 404 Not Found
+```
+
+FeignClient có thể phát sinh:
+
+```text
+FeignException.NotFound
+```
+
+Đây là lỗi **endpoint compatibility** và nghiêm trọng hơn việc thiếu một field JSON.
+
+---
+
+# 6. FeignClient hiện tại
+
+Client sử dụng API cũ:
+
+```java
+package com.vietmart.client;
+
+import com.vietmart.dto.ProductInfo;
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+
+@FeignClient(name = "product-service")
+public interface ProductClient {
+
+    @GetMapping("/api/products/{id}")
+    ProductInfo getById(@PathVariable("id") Long id);
+}
+```
+
+FeignClient đang phụ thuộc vào hai thành phần của API contract:
+
+```text
+1. Endpoint:
+   /api/products/{id}
+
+2. Response:
+   id
+   name
+   price
+```
+
+Do đó, thay đổi một trong hai thành phần mà không có kế hoạch migration có thể làm client hoạt động sai.
+
+---
+
+# 7. Chiến lược versioning API
+
+## 7.1. Chiến lược 1 – URI Versioning
+
+Tạo API version mới:
+
+```http
+GET /api/products/{id}
+```
+
+cho API V1 và:
+
+```http
+GET /api/v2/products/{id}
+```
+
+cho API V2.
+
+Ví dụ:
+
+### V1
+
+```json
+{
+    "id": 100,
+    "name": "Laptop Dell",
+    "price": 25000000
+}
+```
+
+### V2
+
+```json
+{
+    "id": 100,
+    "productName": "Laptop Dell",
+    "price": 25000000
+}
+```
+
+Trong thời gian migration, product-service có thể hỗ trợ đồng thời:
+
+```text
+/api/products/{id}
+        ↓
+       V1
+
+/api/v2/products/{id}
+        ↓
+       V2
+```
+
+### Ưu điểm
+
+* Dễ nhận biết version.
+* Dễ debug.
+* Client có thể migrate từng bước.
+* Không cần cập nhật tất cả service cùng lúc.
+
+### Nhược điểm
+
+* Phải duy trì nhiều API version.
+* Code server có thể bị duplicate.
+* Cần có chính sách deprecation và thời điểm ngừng V1.
+
+---
+
+# 8. Chiến lược 2 – Backward-Compatible API Evolution
+
+Thay vì xóa ngay field `name`, server có thể trả cả hai field trong thời gian migration:
+
+```json
+{
+    "id": 100,
+    "name": "Laptop Dell",
+    "productName": "Laptop Dell",
+    "price": 25000000
+}
+```
+
+Các client cũ tiếp tục sử dụng:
+
+```text
+name
+```
+
+Các client mới chuyển sang:
+
+```text
+productName
+```
+
+Sau khi tất cả client đã migration thành công, server mới loại bỏ:
+
+```text
+name
+```
+
+### Ưu điểm
+
+* Không làm client cũ lỗi ngay lập tức.
+* Có thể migration từng service.
+* Phù hợp với hệ thống có nhiều microservice.
+* Hạn chế downtime.
+
+### Nhược điểm
+
+* Response tạm thời chứa dữ liệu duplicate.
+* Phải quản lý thời gian deprecation.
+* Server phải duy trì compatibility trong một khoảng thời gian.
+
+---
+
+# 9. So sánh hai chiến lược
+
+| Tiêu chí        | URI Versioning                | Backward-Compatible      |
+| --------------- | ----------------------------- | ------------------------ |
+| Cách thực hiện  | `/api/v1`, `/api/v2`          | Giữ API cũ và thêm field |
+| Migration       | Theo từng version             | Theo từng client         |
+| Breaking change | Được cô lập trong version mới | Hạn chế breaking change  |
+| Độ rõ ràng      | Cao                           | Trung bình               |
+| Chi phí duy trì | Cao hơn                       | Thấp hơn trong ngắn hạn  |
+| Phù hợp         | Thay đổi contract lớn         | Thay đổi nhỏ/additive    |
+| Deprecation     | Có                            | Có                       |
+
+Đối với thay đổi `name` → `productName`, backward-compatible evolution là lựa chọn phù hợp nếu chỉ cần thay đổi tên field.
+
+Nếu API V2 có nhiều thay đổi lớn về schema hoặc semantics, URI versioning sẽ rõ ràng và an toàn hơn.
+
+---
+
+# 10. Giải pháp DTO Migration bằng `@JsonAlias`
+
+Client cần nhận được cả:
+
+```text
+name
+```
+
+và:
+
+```text
+productName
+```
+
+Có thể sử dụng Jackson `@JsonAlias`.
+
+## `ProductInfo.java`
+
+```java
+package com.vietmart.dto;
+
+import com.fasterxml.jackson.annotation.JsonAlias;
+
+public record ProductInfo(
+        Long id,
+
+        @JsonAlias({"name", "productName"})
+        String name,
+
+        Long price
+) {
+}
+```
+
+Annotation:
+
+```java
+@JsonAlias({"name", "productName"})
+```
+
+cho phép field `name` nhận dữ liệu từ cả hai JSON property:
+
+```json
+"name": "Laptop Dell"
+```
+
+hoặc:
+
+```json
+"productName": "Laptop Dell"
+```
+
+Trong cả hai trường hợp:
+
+```java
+productInfo.name()
+```
+
+đều trả về:
+
+```text
+Laptop Dell
+```
+
+---
+
+# 11. Kiểm thử DTO migration
+
+## `ProductInfoTest.java`
+
+```java
+package com.vietmart;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.vietmart.dto.ProductInfo;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class ProductInfoTest {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Test
+    void shouldDeserializeOldResponseFormat() throws Exception {
+
+        String json = """
+                {
+                    "id": 100,
+                    "name": "Laptop Dell",
+                    "price": 25000000
+                }
+                """;
+
+        ProductInfo productInfo =
+                objectMapper.readValue(json, ProductInfo.class);
+
+        assertEquals(100L, productInfo.id());
+        assertNotNull(productInfo.name());
+        assertEquals("Laptop Dell", productInfo.name());
+        assertEquals(25000000L, productInfo.price());
+    }
+
+    @Test
+    void shouldDeserializeNewResponseFormat() throws Exception {
+
+        String json = """
+                {
+                    "id": 100,
+                    "productName": "Laptop Dell",
+                    "price": 25000000
+                }
+                """;
+
+        ProductInfo productInfo =
+                objectMapper.readValue(json, ProductInfo.class);
+
+        assertEquals(100L, productInfo.id());
+        assertNotNull(productInfo.name());
+        assertEquals("Laptop Dell", productInfo.name());
+        assertEquals(25000000L, productInfo.price());
     }
 }
 ```
 
-Implementation này có nhiều vấn đề.
-
-## 2.1. Không cấu hình timeout
-
-`RestTemplate` không có `connectTimeout` và `readTimeout` phù hợp.
-
-Khi `product-service` phản hồi chậm hoặc bị treo, request có thể giữ thread trong thời gian dài.
-
-Ví dụ:
-
-```text
-Inventory Service
-       |
-       | HTTP request
-       v
-Product Service
-       |
-       | không phản hồi
-       |
-       | 30 giây
-       v
-Inventory thread bị block
-```
-
-Nếu có nhiều request đồng thời, số lượng thread bị block sẽ tăng nhanh.
-
 ---
 
-## 2.2. Không sử dụng `@LoadBalanced`
+# 12. Kết quả mong đợi
 
-`RestTemplate` ban đầu không được đánh dấu:
+Chạy:
 
-```java
-@LoadBalanced
+```bash
+./gradlew test
 ```
 
-Do đó không thể sử dụng service discovery để resolve:
+Windows:
 
-```text
-http://product-service/...
+```cmd
+gradlew.bat test
 ```
-
-Một RestTemplate thông thường chỉ xử lý URL mà HTTP client có thể resolve trực tiếp.
-
----
-
-## 2.3. Hardcode IP và port
-
-Code sử dụng:
-
-```text
-http://192.168.0.12:8082
-```
-
-Đây là một vấn đề trong hệ thống microservices vì:
-
-* IP có thể thay đổi.
-* Port có thể thay đổi.
-* Có thể có nhiều instance của `product-service`.
-* Không tận dụng được Eureka/Service Discovery.
-* Khó triển khai trên Docker, Kubernetes hoặc môi trường cloud.
-
-Giải pháp là sử dụng service-id:
-
-```text
-http://product-service/api/stock/{pid}
-```
-
-và để Service Discovery tìm instance phù hợp.
-
----
-
-## 2.4. Không có fallback
-
-Nếu `product-service` timeout hoặc không thể kết nối, exception sẽ được truyền ngược lên caller.
-
-Implementation cần xử lý:
-
-```java
-ResourceAccessException
-```
-
-và trả về:
-
-```java
-StockInfo.unavailable()
-```
-
----
-
-# 3. Cơ chế Cascading Failure
-
-Cascading failure xảy ra khi một service bị lỗi hoặc chậm làm các service phụ thuộc vào nó cũng bị ảnh hưởng theo.
-
-Trong hệ thống VietMart, luồng lỗi có thể xảy ra như sau:
-
-```text
-Product Service chậm
-        |
-        v
-Inventory Service gọi Product Service
-        |
-        v
-Không có timeout
-        |
-        v
-Inventory thread bị block
-        |
-        v
-Thread pool dần cạn
-        |
-        v
-Request mới phải chờ
-        |
-        v
-Response time tăng
-        |
-        v
-Inventory Service quá tải
-        |
-        v
-Inventory Service có thể timeout/crash
-        |
-        v
-Order Service gọi Inventory Service
-        |
-        v
-Order Service cũng bị chậm
-        |
-        v
-Cascading Failure
-```
-
-## 3.1. Ví dụ tải cao điểm
-
-Giả sử:
-
-```text
-50 request/giây
-```
-
-và mỗi request bị block khoảng:
-
-```text
-30 giây
-```
-
-Số lượng thread-second bị tiêu tốn có thể lên tới:
-
-```text
-50 × 30 = 1500 thread-seconds
-```
-
-Nếu thread pool có giới hạn, các request mới sẽ không còn thread để xử lý.
-
-Kết quả:
-
-* Response time tăng.
-* Request timeout.
-* Connection pool bị ảnh hưởng.
-* CPU/memory có thể tăng.
-* Service có thể trở nên không phản hồi.
-* Lỗi lan sang service gọi nó.
-
----
-
-# 4. Giải pháp
-
-Giải pháp được áp dụng gồm bốn thành phần:
-
-1. `@LoadBalanced RestTemplate`.
-2. `connectTimeout = 1 giây`.
-3. `readTimeout = 2 giây`.
-4. Fallback khi xảy ra `ResourceAccessException`.
-
-Luồng sau khi sửa:
-
-```text
-Order Service
-      |
-      v
-Inventory Service
-      |
-      v
-@LoadBalanced RestTemplate
-      |
-      v
-Product Service
-      |
-      | không phản hồi
-      |
-      | tối đa khoảng 2 giây
-      v
-Read Timeout
-      |
-      v
-ResourceAccessException
-      |
-      v
-StockInfo.unavailable()
-      |
-      v
-Inventory Service trả response
-```
-
-Nhờ timeout, thread không bị giữ trong thời gian không xác định.
-
----
-
-# 5. RestTemplate Configuration
-
-`RestTemplate` được cấu hình với:
-
-```text
-connectTimeout = 1000 ms
-readTimeout    = 2000 ms
-```
-
-và sử dụng:
-
-```java
-@LoadBalanced
-```
-
-Mục đích:
-
-* `connectTimeout`: giới hạn thời gian thiết lập kết nối.
-* `readTimeout`: giới hạn thời gian chờ dữ liệu phản hồi.
-* `@LoadBalanced`: cho phép sử dụng service-id thông qua Service Discovery.
-
----
-
-# 6. StockCheckClient sau khi sửa
-
-Client sử dụng service-id:
-
-```text
-http://product-service/api/stock/{pid}
-```
-
-thay vì IP hardcode:
-
-```text
-http://192.168.0.12:8082/api/stock/{pid}
-```
-
-Khi request gặp lỗi kết nối hoặc timeout, `ResourceAccessException` được xử lý:
-
-```java
-catch (ResourceAccessException e) {
-    return StockInfo.unavailable();
-}
-```
-
-Fallback được định nghĩa trong `StockInfo`:
-
-```java
-public static StockInfo unavailable() {
-    return new StockInfo(
-            null,
-            false,
-            0,
-            "UNAVAILABLE"
-    );
-}
-```
-
-Điều này giúp `inventory-service` vẫn trả về một kết quả có ý nghĩa thay vì để exception tiếp tục lan truyền.
-
----
-
-# 7. Mô phỏng Product Service chậm
-
-Để kiểm chứng timeout, bài sử dụng **WireMock**.
-
-WireMock được chạy tại:
-
-```text
-http://localhost:8089
-```
-
-Endpoint giả lập:
-
-```text
-GET /api/stock/100
-```
-
-được cấu hình cố tình delay:
-
-```text
-5000 ms
-```
-
-Tức là Product Service giả lập sẽ mất 5 giây mới trả response.
-
-Response giả lập:
-
-```json
-{
-  "productId": 100,
-  "available": true,
-  "quantity": 50,
-  "status": "AVAILABLE"
-}
-```
-
----
-
-# 8. Integration Test
-
-Integration test sử dụng:
-
-```java
-@SpringBootTest
-```
-
-và cấu hình Simple Discovery:
-
-```properties
-eureka.client.enabled=false
-spring.cloud.discovery.client.simple.instances.product-service[0].uri=http://localhost:8089
-```
-
-Điều này cho phép test sử dụng:
-
-```text
-product-service
-```
-
-nhưng thực tế request được chuyển tới:
-
-```text
-localhost:8089
-```
-
-WireMock đóng vai trò Product Service giả lập.
-
-Test gọi trực tiếp implementation thật:
-
-```java
-StockInfo result = stockCheckClient.checkStock(100L);
-```
-
-Không mock `StockCheckClient`.
-
----
-
-# 9. Kết quả mong đợi
-
-WireMock được cấu hình delay:
-
-```text
-5000 ms
-```
-
-Trong khi RestTemplate có:
-
-```text
-Connect Timeout = 1000 ms
-Read Timeout    = 2000 ms
-```
-
-Do đó request không được phép chờ đủ 5 giây.
-
-Khi read timeout xảy ra:
-
-```text
-ResourceAccessException
-        |
-        v
-StockInfo.unavailable()
-```
-
-Test kiểm tra:
-
-```java
-assertNotNull(result);
-
-assertEquals(
-        "UNAVAILABLE",
-        result.getStatus()
-);
-
-assertFalse(
-        result.isAvailable()
-);
-
-assertEquals(
-        0,
-        result.getQuantity()
-);
-
-assertTrue(
-        elapsedMilliseconds < 3000
-);
-```
-
----
-
-# 10. Kết quả thực nghiệm
-
-Kết quả test dự kiến:
-
-```text
-========================================
-CASCADING FAILURE TIMEOUT TEST
-========================================
-WireMock delay : 5000 ms
-Connect timeout: 1000 ms
-Read timeout   : 2000 ms
-Actual time    : ~2000 ms
-Result         : StockInfo{
-    productId=null,
-    available=false,
-    quantity=0,
-    status='UNAVAILABLE'
-}
-========================================
-
-BUILD SUCCESSFUL
-```
-
-Điểm quan trọng:
-
-```text
-WireMock delay = 5000 ms
-Actual response < 3000 ms
-```
-
-Điều này chứng minh:
-
-> Inventory Service không chờ Product Service đủ 5 giây mà chủ động timeout và trả fallback.
-
----
-
-# 11. Ý nghĩa của Integration Test
-
-Test không chỉ kiểm tra kết quả fallback.
-
-Nó kiểm tra toàn bộ luồng:
-
-```text
-StockCheckClient
-      |
-      v
-@LoadBalanced RestTemplate
-      |
-      v
-Simple Discovery
-      |
-      v
-product-service
-      |
-      v
-WireMock
-      |
-      | delay 5 giây
-      v
-Read Timeout
-      |
-      v
-ResourceAccessException
-      |
-      v
-StockInfo.unavailable()
-```
-
-Ngoài ra test xác nhận WireMock thực sự nhận request bằng:
-
-```java
-wireMockServer.verify(
-        1,
-        getRequestedFor(
-                urlPathEqualTo("/api/stock/100")
-        )
-);
-```
-
-Do đó fallback không phải do test tự tạo ra mà là kết quả của việc timeout trong client.
-
----
-
-# 12. Tại sao Timeout giúp giảm Cascading Failure?
-
-Không có timeout:
-
-```text
-Product Service
-      |
-      | treo
-      v
-Inventory thread
-      |
-      | block lâu
-      v
-Thread pool cạn
-```
-
-Có timeout:
-
-```text
-Product Service
-      |
-      | treo
-      v
-Inventory thread
-      |
-      | tối đa khoảng 2s
-      v
-Timeout
-      |
-      v
-Fallback
-      |
-      v
-Thread được giải phóng
-```
-
-Timeout biến một dependency failure kéo dài thành một lỗi được giới hạn về thời gian.
-
-Tuy nhiên, timeout **không hoàn toàn loại bỏ cascading failure**.
-
----
-
-# 13. Sau khi có Timeout, Order Service còn có thể bị ảnh hưởng không?
-
-**Có.**
-
-Timeout chỉ giới hạn thời gian mỗi request gọi `product-service`.
-
-Nếu `inventory-service` vẫn nhận một lượng request cực lớn, nó vẫn có thể bị quá tải.
-
-Ví dụ:
-
-```text
-1000 request/giây
-       |
-       v
-Inventory Service
-       |
-       +----> Product Service
-       |
-       +----> Product Service
-       |
-       +----> Product Service
-       |
-       v
-Nhiều request timeout
-       |
-       v
-CPU / thread / connection pool tăng tải
-       |
-       v
-Inventory Service quá tải
-       |
-       v
-Order Service tiếp tục bị ảnh hưởng
-```
-
-Vì vậy timeout là cần thiết nhưng chưa đủ.
-
----
-
-# 14. Biện pháp bổ sung: Circuit Breaker
-
-Biện pháp được đề xuất là sử dụng **Circuit Breaker**, ví dụ với Resilience4j.
-
-Circuit Breaker theo dõi tỷ lệ lỗi và timeout của các request tới `product-service`.
-
-Khi số lượng lỗi vượt ngưỡng:
-
-```text
-CLOSED
-   |
-   | nhiều timeout/failure
-   v
-OPEN
-```
-
-Ở trạng thái `OPEN`, các request mới không tiếp tục gọi Product Service mà trả fallback ngay.
-
-Sau một khoảng thời gian:
-
-```text
-OPEN
-  |
-  | wait duration
-  v
-HALF_OPEN
-  |
-  | thử một số request
-  v
-+------------------+
-|                  |
-v                  v
-SUCCESS          FAILURE
-  |                  |
-  v                  v
-CLOSED             OPEN
-```
-
-## Lợi ích
-
-Circuit Breaker giúp:
-
-* Không tiếp tục gửi hàng nghìn request tới service đang lỗi.
-* Giảm tải cho Product Service.
-* Giảm số lượng thread bị giữ tại Inventory Service.
-* Fallback nhanh hơn.
-* Ngăn lỗi lan sang Order Service.
-* Tăng khả năng phục hồi của hệ thống microservices.
-
-Có thể kết hợp:
-
-```text
-Timeout
-   +
-Circuit Breaker
-   +
-Fallback
-```
-
-để tạo cơ chế bảo vệ nhiều lớp.
-
----
-
-# 15. So sánh trước và sau khi sửa
-
-| Tiêu chí                | Trước khi sửa  | Sau khi sửa               |
-| ----------------------- | -------------- | ------------------------- |
-| Timeout                 | Không có       | Có                        |
-| Connect timeout         | Không cấu hình | 1 giây                    |
-| Read timeout            | Không cấu hình | 2 giây                    |
-| Service ID              | Không          | Có                        |
-| Hardcode IP             | Có             | Không                     |
-| Load balancing          | Không          | `@LoadBalanced`           |
-| Exception handling      | Không          | `ResourceAccessException` |
-| Fallback                | Không          | `StockInfo.unavailable()` |
-| Dependency chậm 5s      | Có thể chờ lâu | Timeout khoảng 2s         |
-| Thread bị block lâu     | Có             | Được giải phóng sớm       |
-| Chống cascading failure | Kém            | Tốt hơn                   |
-| Circuit Breaker         | Không          | Đề xuất bổ sung           |
-
----
-
-# 16. Kết luận
-
-Bài tập đã xác định nguyên nhân chính gây cascading failure là việc sử dụng `RestTemplate` không có timeout khi gọi dependency.
-
-Giải pháp đã triển khai:
-
-```text
-@LoadBalanced RestTemplate
-        +
-Connect Timeout = 1s
-        +
-Read Timeout = 2s
-        +
-ResourceAccessException handling
-        +
-StockInfo.unavailable()
-```
-
-Integration Test sử dụng WireMock mô phỏng Product Service delay 5 giây.
 
 Kết quả mong đợi:
 
 ```text
-Server delay = 5 giây
-Response      < 3 giây
-Fallback      = UNAVAILABLE
+ProductInfoTest > shouldDeserializeOldResponseFormat PASSED
+
+ProductInfoTest > shouldDeserializeNewResponseFormat PASSED
+
+2 tests completed, 0 failed
 ```
 
-Điều này chứng minh timeout hoạt động và Inventory Service không bị giữ thread chờ dependency trong thời gian 5 giây.
+Điều này chứng minh DTO client có thể tương thích với cả:
 
-Để tăng khả năng chống cascading failure trong môi trường production, có thể kết hợp thêm **Circuit Breaker với Resilience4j**, giúp tạm thời ngắt các request tới dependency đang lỗi và trả fallback ngay.
+```text
+API V1:
+name
+```
+
+và:
+
+```text
+API V2:
+productName
+```
+
+mà không làm `ProductInfo.name()` trở thành `null`.
 
 ---
+
+# 13. Cấu trúc source code
+
+```text
+bai4/
+└── product-client-demo/
+    ├── build.gradle
+    ├── settings.gradle
+    └── src/
+        ├── main/
+        │   └── java/
+        │       └── com/
+        │           └── vietmart/
+        │               ├── client/
+        │               │   └── ProductClient.java
+        │               └── dto/
+        │                   └── ProductInfo.java
+        │
+        └── test/
+            └── java/
+                └── com/
+                    └── vietmart/
+                        └── ProductInfoTest.java
+```
+
+---
+
+# 14. Dependency
+
+Các thư viện chính:
+
+```gradle
+dependencies {
+
+    implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'
+
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+```
+
+JUnit 5 được cung cấp thông qua:
+
+```text
+spring-boot-starter-test
+```
+
+Không cần khai báo JUnit riêng.
+
+---
+
+# 15. Phân tích mức độ ảnh hưởng
+
+Có thể phân loại tác động của API contract như sau:
+
+```text
+API Contract
+     |
+     +---- Endpoint thay đổi
+     |        |
+     |        +---- HTTP 404
+     |        +---- FeignException
+     |        +---- Business request thất bại
+     |
+     +---- JSON field thay đổi
+              |
+              +---- Field = null
+              +---- Dữ liệu không đầy đủ
+              +---- Có thể NPE
+              +---- Có thể sai business logic
+```
+
+Điều này cho thấy FeignClient tạo ra sự phụ thuộc trực tiếp giữa consumer và provider.
+
+---
+
+# 16. Khuyến nghị khi thay đổi API
+
+Khi thay đổi API của `product-service`, cần thực hiện theo quy trình:
+
+```text
+1. Xác định breaking change
+          ↓
+2. Kiểm tra tất cả consumer
+          ↓
+3. Thiết kế migration strategy
+          ↓
+4. Implement backward compatibility
+          ↓
+5. Update từng FeignClient
+          ↓
+6. Integration testing
+          ↓
+7. Theo dõi production
+          ↓
+8. Deprecate API cũ
+          ↓
+9. Remove API cũ
+```
+
+Không nên thay đổi trực tiếp API đang được nhiều service sử dụng mà không có migration plan.
+
+---
+
+# 17. Kết luận
+
+FeignClient giúp các microservice giao tiếp thuận tiện nhưng đồng thời tạo ra sự phụ thuộc vào API contract của service cung cấp.
+
+Hai thay đổi được phân tích:
+
+### Thay đổi field
+
+```text
+name → productName
+```
+
+có thể khiến client nhận:
+
+```text
+name = null
+```
+
+và gây lỗi hoặc dữ liệu không chính xác.
+
+### Thay đổi endpoint
+
+```text
+/api/products/{id}
+        ↓
+/api/v2/products/{id}
+```
+
+có thể khiến FeignClient cũ nhận:
+
+```text
+HTTP 404
+```
+
+và phát sinh exception.
+
+Để giảm rủi ro, có thể sử dụng:
+
+1. **URI Versioning** – duy trì V1 và V2 song song.
+2. **Backward-Compatible Evolution** – giữ API cũ trong thời gian migration.
+
+Đối với trường hợp đổi tên field `name` thành `productName`, sử dụng:
+
+```java
+@JsonAlias({"name", "productName"})
+```
+
+giúp client nhận được cả hai định dạng trong giai đoạn migration.
+
+Do đó, việc quản lý API contract và có migration strategy là yếu tố quan trọng để tránh breaking change trong kiến trúc microservices.
