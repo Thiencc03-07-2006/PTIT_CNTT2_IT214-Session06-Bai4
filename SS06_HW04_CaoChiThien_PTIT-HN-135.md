@@ -326,23 +326,22 @@ Do đó, thay đổi một trong hai thành phần mà không có kế hoạch m
 
 ## 7.1. Chiến lược 1 – URI Versioning
 
-Tạo API version mới:
+Giữ API cũ và bổ sung API phiên bản mới.
+
+**API cũ**
 
 ```http
 GET /api/products/{id}
 ```
-
-cho API V1 và:
+**API mới (V2)**
 
 ```http
 GET /api/v2/products/{id}
 ```
 
-cho API V2.
-
 Ví dụ:
 
-### V1
+### API cũ
 
 ```json
 {
@@ -352,7 +351,7 @@ Ví dụ:
 }
 ```
 
-### V2
+### API mới (V2)
 
 ```json
 {
@@ -367,11 +366,11 @@ Trong thời gian migration, product-service có thể hỗ trợ đồng thời
 ```text
 /api/products/{id}
         ↓
-       V1
+       API cũ
 
 /api/v2/products/{id}
         ↓
-       V2
+       API mới (V2)
 ```
 
 ### Ưu điểm
