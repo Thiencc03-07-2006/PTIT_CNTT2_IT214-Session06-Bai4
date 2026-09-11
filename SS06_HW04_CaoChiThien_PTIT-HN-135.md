@@ -438,7 +438,7 @@ name
 
 | Tiêu chí        | URI Versioning                | Backward-Compatible      |
 | --------------- | ----------------------------- | ------------------------ |
-| Cách thực hiện  | `/api/v1`, `/api/v2`          | Giữ API cũ và thêm field |
+| Cách thực hiện  | Giữ /api/products/{id} và bổ sung /api/v2/products/{id}         | Giữ API cũ và thêm field |
 | Migration       | Theo từng version             | Theo từng client         |
 | Breaking change | Được cô lập trong version mới | Hạn chế breaking change  |
 | Độ rõ ràng      | Cao                           | Trung bình               |
